@@ -1,5 +1,6 @@
 import streamlit as st
 import streamlit.components.v1 as components
+import json
 import sqlite3
 import hashlib
 import base64
@@ -126,6 +127,42 @@ st.set_page_config(
     page_title="MyChat",
     page_icon="💬",
     layout="wide"
+)
+
+# ==========================================
+# "REPLIED TO" PREVIEW STYLING
+# (the small clickable snippet shown above a
+# message that was sent as a reply -- style it
+# like a proper quoted-reply card so it's
+# unmistakable, in both 1-on-1 and group chats)
+# ==========================================
+
+st.markdown(
+    """
+    <style>
+    div[class*="st-key-jump_to_"] button,
+    div[class*="st-key-group_jump_to_"] button {
+        background: #f0f2f5 !important;
+        border: none !important;
+        border-left: 4px solid #06d755 !important;
+        border-radius: 6px !important;
+        text-align: left !important;
+        justify-content: flex-start !important;
+        color: #3b4a54 !important;
+        font-size: 13px !important;
+        font-weight: 400 !important;
+        white-space: normal !important;
+        height: auto !important;
+        padding: 6px 10px !important;
+        margin-bottom: 2px !important;
+    }
+    div[class*="st-key-jump_to_"] button:hover,
+    div[class*="st-key-group_jump_to_"] button:hover {
+        background: #e4e6ea !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
 )
 
 
@@ -2740,6 +2777,96 @@ def to_local_time_str(raw_time):
 
     except ValueError:
         return raw_time
+
+
+def render_copy_button(key, text_to_copy, toast_text="📋 Copied"):
+    """A small reusable '📋 Copy' button that copies text_to_copy to
+    the clipboard via the browser's clipboard API. Used for both
+    text messages and attachments (voice/image/video/file), in both
+    the 1-on-1 and group chats."""
+
+    if st.button(
+        "📋",
+        key=key,
+        help="Copy"
+    ):
+        components.html(
+            f"""
+            <script>
+            navigator.clipboard.writeText({json.dumps(str(text_to_copy))});
+            </script>
+            """,
+            height=0
+        )
+        st.toast(toast_text)
+
+
+def render_message_actions_menu(
+    key_prefix,
+    reply_state_key,
+    reply_value,
+    forward_id_key,
+    forward_content_key,
+    forward_content,
+    copy_text,
+    copy_toast,
+    delete_action
+):
+    """A single '⋮' button per message that opens a small popover
+    with Reply / Forward / Copy / Delete inside it -- used for every
+    message type (text, voice, image, video, file) in both the
+    1-on-1 and group chats, so the message row itself stays clean.
+
+    delete_action must be a zero-argument callable that performs the
+    actual deletion (DB row + any file on disk). This function calls
+    st.rerun() itself after each action, so delete_action should not
+    call st.rerun() on its own.
+    """
+
+    with st.popover(
+        "⋮",
+        key=f"{key_prefix}_menu"
+    ):
+
+        if st.button(
+            "↩️ Reply",
+            key=f"{key_prefix}_reply_btn",
+            use_container_width=True
+        ):
+            st.session_state[reply_state_key] = reply_value
+            st.rerun()
+
+        if st.button(
+            "↗️ Forward",
+            key=f"{key_prefix}_forward_btn",
+            use_container_width=True
+        ):
+            st.session_state[forward_id_key] = reply_value
+            st.session_state[forward_content_key] = forward_content
+            st.rerun()
+
+        if st.button(
+            "📋 Copy",
+            key=f"{key_prefix}_copy_btn",
+            use_container_width=True
+        ):
+            components.html(
+                f"""
+                <script>
+                navigator.clipboard.writeText({json.dumps(str(copy_text))});
+                </script>
+                """,
+                height=0
+            )
+            st.toast(copy_toast)
+
+        if st.button(
+            "🗑️ Delete",
+            key=f"{key_prefix}_delete_btn",
+            use_container_width=True
+        ):
+            delete_action()
+            st.rerun()
 
 
 def touch_last_active(username):
@@ -6518,56 +6645,35 @@ if page == "Groups":
 
             with col2:
 
-                if st.button(
-                    "↩️",
-                    key=f"group_reply_voice_{group_id}_{message_id}"
-                ):
-
-                    st.session_state[
-                        "group_reply_to"
-                    ] = message_id
-
-                    st.rerun()
-
-                if st.button(
-                    "↗️",
-                    key=f"group_forward_voice_{group_id}_{message_id}"
-                ):
-                    st.session_state["group_forward_message_id"] = message_id
-                    st.session_state["group_forward_message_content"] = str(msg)
-                    st.rerun()
-
-                if st.button(
-                    "🗑️",
-                    key=f"group_delete_voice_{group_id}_{message_id}"
-                ):
-
+                def _delete_group_voice_message(_mid=message_id, _path=audio_path):
                     cursor.execute(
                         """
                         DELETE FROM group_messages
                         WHERE id = ?
                         """,
-                        (message_id,)
+                        (_mid,)
                     )
-
                     conn.commit()
-                    if os.path.exists(
-                        audio_path
-                    ):
 
+                    if os.path.exists(_path):
                         try:
-                            os.remove(
-                                audio_path
-                            )
+                            os.remove(_path)
                         except:
                             pass
 
-                    st.session_state.pop(
-                        "group_reply_to",
-                        None
-                    )
+                    st.session_state.pop("group_reply_to", None)
 
-                    st.rerun()
+                render_message_actions_menu(
+                    key_prefix=f"group_voice_{group_id}_{message_id}",
+                    reply_state_key="group_reply_to",
+                    reply_value=message_id,
+                    forward_id_key="group_forward_message_id",
+                    forward_content_key="group_forward_message_content",
+                    forward_content=str(msg),
+                    copy_text=audio_path,
+                    copy_toast="📋 Voice message path copied",
+                    delete_action=_delete_group_voice_message
+                )
 
             continue
         
@@ -6641,51 +6747,33 @@ if page == "Groups":
 
             with col2:
 
-                if st.button(
-                    "↩️",
-                    key=f"group_reply_image_{group_id}_{message_id}"
-                ):
-
-                    st.session_state[
-                        "group_reply_to"
-                    ] = message_id
-
-                    st.rerun()
-
-                if st.button(
-                    "↗️",
-                    key=f"group_forward_image_{group_id}_{message_id}"
-                ):
-                    st.session_state["group_forward_message_id"] = message_id
-                    st.session_state["group_forward_message_content"] = str(msg)
-                    st.rerun()
-
-                if st.button(
-                    "🗑️",
-                    key=f"group_delete_image_{group_id}_{message_id}"
-                ):
+                def _delete_group_image_message(_mid=message_id, _path=image_path):
                     cursor.execute(
                         """
                         DELETE FROM group_messages
                         WHERE id = ?
                         """,
-                        (message_id,)
+                        (_mid,)
                     )
-
                     conn.commit()
 
-                    if os.path.exists(
-                        image_path
-                    ):
-
+                    if os.path.exists(_path):
                         try:
-                            os.remove(
-                                image_path
-                            )
+                            os.remove(_path)
                         except:
                             pass
 
-                    st.rerun()
+                render_message_actions_menu(
+                    key_prefix=f"group_image_{group_id}_{message_id}",
+                    reply_state_key="group_reply_to",
+                    reply_value=message_id,
+                    forward_id_key="group_forward_message_id",
+                    forward_content_key="group_forward_message_content",
+                    forward_content=str(msg),
+                    copy_text=image_path,
+                    copy_toast="📋 Image path copied",
+                    delete_action=_delete_group_image_message
+                )
 
             continue
         # ------------------------------------------
@@ -6756,51 +6844,33 @@ if page == "Groups":
 
             with col2:
 
-                if st.button(
-                    "↩️",
-                    key=f"group_reply_video_{group_id}_{message_id}"
-                ):
-
-                    st.session_state[
-                        "group_reply_to"
-                    ] = message_id
-
-                    st.rerun()
-
-                if st.button(
-                    "↗️",
-                    key=f"group_forward_video_{group_id}_{message_id}"
-                ):
-                    st.session_state["group_forward_message_id"] = message_id
-                    st.session_state["group_forward_message_content"] = str(msg)
-                    st.rerun()
-
-                if st.button(
-                    "🗑️",
-                    key=f"group_delete_video_{group_id}_{message_id}"
-                ):
+                def _delete_group_video_message(_mid=message_id, _path=video_path):
                     cursor.execute(
                         """
                         DELETE FROM group_messages
                         WHERE id = ?
                         """,
-                        (message_id,)
+                        (_mid,)
                     )
-
                     conn.commit()
 
-                    if os.path.exists(
-                        video_path
-                    ):
-    
+                    if os.path.exists(_path):
                         try:
-                            os.remove(
-                                video_path
-                            )
+                            os.remove(_path)
                         except:
                             pass
 
-                    st.rerun()
+                render_message_actions_menu(
+                    key_prefix=f"group_video_{group_id}_{message_id}",
+                    reply_state_key="group_reply_to",
+                    reply_value=message_id,
+                    forward_id_key="group_forward_message_id",
+                    forward_content_key="group_forward_message_content",
+                    forward_content=str(msg),
+                    copy_text=video_path,
+                    copy_toast="📋 Video path copied",
+                    delete_action=_delete_group_video_message
+                )
 
             continue
         # ------------------------------------------
@@ -6884,51 +6954,33 @@ if page == "Groups":
                 )
             with col2:
 
-                if st.button(
-                    "↩️",
-                    key=f"group_reply_file_{group_id}_{message_id}"
-                ):
-
-                    st.session_state[
-                        "group_reply_to"
-                    ] = message_id
-
-                    st.rerun()
-
-                if st.button(
-                    "↗️",
-                    key=f"group_forward_file_{group_id}_{message_id}"
-                ):
-                    st.session_state["group_forward_message_id"] = message_id
-                    st.session_state["group_forward_message_content"] = str(msg)
-                    st.rerun()
-
-                if st.button(
-                    "🗑️",
-                    key=f"group_delete_file_{group_id}_{message_id}"
-                ):
-
+                def _delete_group_file_message(_mid=message_id, _path=file_path):
                     cursor.execute(
                         """
                         DELETE FROM group_messages
                         WHERE id = ?
                         """,
-                        (message_id,)
+                        (_mid,)
                     )
                     conn.commit()
 
-                    if os.path.exists(
-                        file_path
-                    ):
-
+                    if os.path.exists(_path):
                         try:
-                            os.remove(
-                                file_path
-                            )
+                            os.remove(_path)
                         except:
                             pass
 
-                    st.rerun()
+                render_message_actions_menu(
+                    key_prefix=f"group_file_{group_id}_{message_id}",
+                    reply_state_key="group_reply_to",
+                    reply_value=message_id,
+                    forward_id_key="group_forward_message_id",
+                    forward_content_key="group_forward_message_content",
+                    forward_content=str(msg),
+                    copy_text=file_path,
+                    copy_toast="📋 File path copied",
+                    delete_action=_delete_group_file_message
+                )
 
             continue
 
@@ -7052,64 +7104,30 @@ if page == "Groups":
 
         with col2:
 
-            # --------------------------------------
-            # REPLY
-            # --------------------------------------
-
-            if st.button(
-                "↩️",
-                key=f"group_reply_{group_id}_{message_id}",
-                help="Reply to this message"
-            ):
-
-                st.session_state[
-                    "group_reply_to"
-                ] = message_id
-
-                st.rerun()
-
-            # --------------------------------------
-            # FORWARD
-            # --------------------------------------
-
-            if st.button(
-                "↗️",
-                key=f"group_forward_{group_id}_{message_id}",
-                help="Forward this message"
-            ):
-                st.session_state["group_forward_message_id"] = message_id
-                st.session_state["group_forward_message_content"] = str(msg)
-                st.rerun()
-
-            # --------------------------------------
-            # DELETE
-            # --------------------------------------
-            if st.button(
-                "🗑️",
-                key=f"group_delete_{group_id}_{message_id}",
-                help="Delete this message"
-            ):
-
+            def _delete_group_text_message(_mid=message_id):
                 cursor.execute(
                     """
                     DELETE FROM group_messages
                     WHERE id = ?
                     """,
-                    (message_id,)
+                    (_mid,)
                 )
-
                 conn.commit()
 
-                if st.session_state.get(
-                    "group_reply_to"
-                ) == message_id:
+                if st.session_state.get("group_reply_to") == _mid:
+                    st.session_state.pop("group_reply_to", None)
 
-                    st.session_state.pop(
-                        "group_reply_to",
-                        None
-                    )
-
-                st.rerun()
+            render_message_actions_menu(
+                key_prefix=f"group_text_{group_id}_{message_id}",
+                reply_state_key="group_reply_to",
+                reply_value=message_id,
+                forward_id_key="group_forward_message_id",
+                forward_content_key="group_forward_message_content",
+                forward_content=str(msg),
+                copy_text=clean_msg,
+                copy_toast="📋 Message copied",
+                delete_action=_delete_group_text_message
+            )
 
     # Clear the "jump to" highlight after this render pass, so it
     # behaves like a one-time flash rather than a permanent marker.
@@ -7419,8 +7437,8 @@ if page == "Groups":
 
     with group_footer_box:
 
-        col1, col2, col3, col4 = st.columns(
-            [7, 0.7, 0.7, 0.7],
+        col1, col_emoji, col2, col3, col4 = st.columns(
+            [6.3, 0.7, 0.7, 0.7, 0.7],
             vertical_alignment="center"
         )
 
@@ -7436,6 +7454,37 @@ if page == "Groups":
                 label_visibility="collapsed",
                 key=f"group_message_{group_id}"
             )
+
+        # ==============================================
+        # EMOJI PICKER
+        # ==============================================
+
+        with col_emoji:
+
+            with st.popover("😊"):
+
+                _group_message_key = f"group_message_{group_id}"
+
+                _emoji_options = [
+                    "😀", "😂", "😍", "👍", "🙏", "🎉",
+                    "❤️", "😢", "😮", "🔥", "👏", "😅",
+                    "🤔", "😎", "🙌", "😴"
+                ]
+
+                _emoji_cols = st.columns(4)
+
+                for _i, _emoji in enumerate(_emoji_options):
+
+                    with _emoji_cols[_i % 4]:
+
+                        if st.button(
+                            _emoji,
+                            key=f"group_emoji_{group_id}_{_i}"
+                        ):
+                            st.session_state[_group_message_key] = (
+                                st.session_state.get(_group_message_key, "") + _emoji
+                            )
+                            st.rerun()
 
         # ==============================================
         # VOICE MESSAGE (toggle recorder, like 1-on-1 chat)
@@ -7455,6 +7504,11 @@ if page == "Groups":
 
         with col3:
 
+            _group_attachment_version_key = f"group_attachment_version_{group_id}"
+
+            if _group_attachment_version_key not in st.session_state:
+                st.session_state[_group_attachment_version_key] = 0
+
             attachment = st.file_uploader(
                 "📎",
                 type=[
@@ -7469,7 +7523,7 @@ if page == "Groups":
                     "doc",
                     "docx"
                 ],
-                key=f"group_attachment_{group_id}",
+                key=f"group_attachment_{group_id}_{st.session_state[_group_attachment_version_key]}",
                 label_visibility="collapsed"
             )
 
@@ -7599,6 +7653,8 @@ if page == "Groups":
                 "group_reply_to",
                 None
             )
+
+            st.session_state[_group_attachment_version_key] += 1
 
             st.rerun()
 
@@ -7879,28 +7935,25 @@ for message_id, sender, msg, time, reply_to in get_messages(
 
             with col2:
 
-                if st.button(
-                    "↩",
-                    key=f"arrow_voice_{message_id}"
-                ):
-                    st.session_state["reply_to"] = int(message_id)
-                    st.rerun()
-
-                if st.button(
-                    "🗑️",
-                    key=f"delete_voice_{message_id}"
-                ):
-
-                    delete_message(message_id)
-
-                    if os.path.exists(audio_path):
-
+                def _delete_voice_message(_mid=message_id, _path=audio_path):
+                    delete_message(_mid)
+                    if os.path.exists(_path):
                         try:
-                            os.remove(audio_path)
+                            os.remove(_path)
                         except:
                             pass
 
-                    st.rerun()
+                render_message_actions_menu(
+                    key_prefix=f"voice_{message_id}",
+                    reply_state_key="reply_to",
+                    reply_value=int(message_id),
+                    forward_id_key="forward_message_id",
+                    forward_content_key="forward_message_content",
+                    forward_content=str(msg),
+                    copy_text=audio_path,
+                    copy_toast="📋 Voice message path copied",
+                    delete_action=_delete_voice_message
+                )
 
             continue
         
@@ -7922,6 +7975,15 @@ for message_id, sender, msg, time, reply_to in get_messages(
         col1, col2 = st.columns([8, 1])
 
         with col1:
+
+            if reply_html:
+                if st.button(
+                    reply_html,
+                    key=f"jump_to_image_{message_id}",
+                    use_container_width=True
+                ):
+                    st.session_state["highlight_message_id"] = reply_to
+                    st.rerun()
 
             if os.path.exists(image_path):
 
@@ -7966,29 +8028,25 @@ for message_id, sender, msg, time, reply_to in get_messages(
 
         with col2:
 
-            if st.button(
-                "↗️",
-                key=f"forward_image_{message_id}"
-            ):
-                st.session_state["forward_message_id"] = message_id
-                st.session_state["forward_message_content"] = str(msg)
-                st.rerun()
-
-            if st.button(
-                "🗑️",
-                key=f"delete_image_{message_id}"
-            ):
-
-                delete_message(message_id)
-
-                if os.path.exists(image_path):
-
+            def _delete_image_message(_mid=message_id, _path=image_path):
+                delete_message(_mid)
+                if os.path.exists(_path):
                     try:
-                        os.remove(image_path)
+                        os.remove(_path)
                     except:
                         pass
 
-                st.rerun()
+            render_message_actions_menu(
+                key_prefix=f"image_{message_id}",
+                reply_state_key="reply_to",
+                reply_value=int(message_id),
+                forward_id_key="forward_message_id",
+                forward_content_key="forward_message_content",
+                forward_content=str(msg),
+                copy_text=image_path,
+                copy_toast="📋 Image path copied",
+                delete_action=_delete_image_message
+            )
 
         # IMPORTANT
         # Prevent image path from appearing as text
@@ -8010,6 +8068,15 @@ for message_id, sender, msg, time, reply_to in get_messages(
         col1, col2 = st.columns([8, 1])
 
         with col1:
+
+            if reply_html:
+                if st.button(
+                    reply_html,
+                    key=f"jump_to_video_{message_id}",
+                    use_container_width=True
+                ):
+                    st.session_state["highlight_message_id"] = reply_to
+                    st.rerun()
 
             if os.path.exists(video_path):
 
@@ -8045,29 +8112,25 @@ for message_id, sender, msg, time, reply_to in get_messages(
 
         with col2:
 
-            if st.button(
-                "↗️",
-                key=f"forward_video_{message_id}"
-            ):
-                st.session_state["forward_message_id"] = message_id
-                st.session_state["forward_message_content"] = str(msg)
-                st.rerun()
-
-            if st.button(
-                "🗑️",
-                key=f"delete_video_{message_id}"
-            ):
-
-                delete_message(message_id)
-
-                if os.path.exists(video_path):
-
+            def _delete_video_message(_mid=message_id, _path=video_path):
+                delete_message(_mid)
+                if os.path.exists(_path):
                     try:
-                        os.remove(video_path)
+                        os.remove(_path)
                     except:
                         pass
 
-                st.rerun()
+            render_message_actions_menu(
+                key_prefix=f"video_{message_id}",
+                reply_state_key="reply_to",
+                reply_value=int(message_id),
+                forward_id_key="forward_message_id",
+                forward_content_key="forward_message_content",
+                forward_content=str(msg),
+                copy_text=video_path,
+                copy_toast="📋 Video path copied",
+                delete_action=_delete_video_message
+            )
 
         # IMPORTANT
         # Prevent video path from appearing as text
@@ -8136,36 +8199,25 @@ for message_id, sender, msg, time, reply_to in get_messages(
 
         with col2:
 
-            if st.button(
-                "↩",
-                key=f"arrow_file_{message_id}"
-            ):
-                st.session_state["reply_to"] = int(message_id)
-                st.rerun()
-
-            if st.button(
-                "↗️",
-                key=f"forward_file_{message_id}"
-            ):
-                st.session_state["forward_message_id"] = message_id
-                st.session_state["forward_message_content"] = str(msg)
-                st.rerun()
-
-            if st.button(
-                "🗑️",
-                key=f"delete_file_{message_id}"
-            ):
-
-                delete_message(message_id)
-
-                if os.path.exists(file_path):
-
+            def _delete_file_message(_mid=message_id, _path=file_path):
+                delete_message(_mid)
+                if os.path.exists(_path):
                     try:
-                        os.remove(file_path)
+                        os.remove(_path)
                     except:
                         pass
 
-                st.rerun()
+            render_message_actions_menu(
+                key_prefix=f"file_{message_id}",
+                reply_state_key="reply_to",
+                reply_value=int(message_id),
+                forward_id_key="forward_message_id",
+                forward_content_key="forward_message_content",
+                forward_content=str(msg),
+                copy_text=file_path,
+                copy_toast="📋 File path copied",
+                delete_action=_delete_file_message
+            )
 
         # IMPORTANT
         # Prevent file path from appearing as text
@@ -8298,30 +8350,18 @@ for message_id, sender, msg, time, reply_to in get_messages(
     # ================= ACTIONS =================
 
     with col2:
-        if st.button(
-            "↩",
-            key=f"arrow_{message_id}"
-        ):
-            # Store the selected message ID
-            st.session_state["reply_to"] = int(message_id)
-            st.rerun()
 
-        if st.button(
-            "↗️",
-            key=f"forward_{message_id}"
-        ):
-            st.session_state["forward_message_id"] = message_id
-            st.session_state["forward_message_content"] = str(msg)
-            st.rerun()
-
-        if st.button(
-            "🗑️",
-            key=f"delete_{message_id}"
-        ):
-
-            delete_message(message_id)
-
-            st.rerun()
+        render_message_actions_menu(
+            key_prefix=f"text_{message_id}",
+            reply_state_key="reply_to",
+            reply_value=int(message_id),
+            forward_id_key="forward_message_id",
+            forward_content_key="forward_message_content",
+            forward_content=str(msg),
+            copy_text=clean_msg,
+            copy_toast="📋 Message copied",
+            delete_action=lambda: delete_message(message_id)
+        )
 
 
 # Clear the "jump to" highlight after this render pass, so it
@@ -8628,8 +8668,8 @@ chat_footer_box = st.container(key="chat_footer_box")
 
 with chat_footer_box:
 
-    col1, col2, col3, col4 = st.columns(
-        [7, 0.7, 0.7, 0.7],
+    col1, col_emoji, col2, col3, col4 = st.columns(
+        [6.3, 0.7, 0.7, 0.7, 0.7],
         vertical_alignment="center"
     )
 
@@ -8645,6 +8685,37 @@ with chat_footer_box:
             label_visibility="collapsed",
             key=f"chat_message_{friend}"
         )
+
+    # ==============================================
+    # EMOJI PICKER
+    # ==============================================
+
+    with col_emoji:
+
+        with st.popover("😊"):
+
+            _chat_message_key = f"chat_message_{friend}"
+
+            _emoji_options = [
+                "😀", "😂", "😍", "👍", "🙏", "🎉",
+                "❤️", "😢", "😮", "🔥", "👏", "😅",
+                "🤔", "😎", "🙌", "😴"
+            ]
+
+            _emoji_cols = st.columns(4)
+
+            for _i, _emoji in enumerate(_emoji_options):
+
+                with _emoji_cols[_i % 4]:
+
+                    if st.button(
+                        _emoji,
+                        key=f"chat_emoji_{friend}_{_i}"
+                    ):
+                        st.session_state[_chat_message_key] = (
+                            st.session_state.get(_chat_message_key, "") + _emoji
+                        )
+                        st.rerun()
 
     # ==============================================
     # VOICE MESSAGE
@@ -8664,6 +8735,11 @@ with chat_footer_box:
 
     with col3:
 
+        _media_upload_version_key = f"media_upload_version_{friend}"
+
+        if _media_upload_version_key not in st.session_state:
+            st.session_state[_media_upload_version_key] = 0
+
         media_file = st.file_uploader(
             "📎",
             type=[
@@ -8682,7 +8758,7 @@ with chat_footer_box:
                 "ppt",
                 "pptx"
             ],
-            key=f"media_upload_{friend}",
+            key=f"media_upload_{friend}_{st.session_state[_media_upload_version_key]}",
             label_visibility="collapsed"
         )
 
@@ -8699,7 +8775,10 @@ with chat_footer_box:
         )
 
 # ==================================================
-# SEND TEXT MESSAGE
+# SEND TEXT MESSAGE / MEDIA
+# (only on an explicit Send click -- not on every
+# rerun -- so an attachment doesn't get re-sent
+# repeatedly while it's still sitting in the uploader)
 # ==================================================
 
 if send_button:
@@ -8710,101 +8789,98 @@ if send_button:
 
         st.rerun()
 
+    elif media_file is not None:
 
-# ==================================================
-# SAVE AND SEND MEDIA
-# ==================================================
-
-if media_file:
-
-    os.makedirs(
-        "chat_media",
-        exist_ok=True
-    )
-
-    extension = os.path.splitext(
-        media_file.name
-    )[1].lower()
-
-    filename = (
-        f"{uuid.uuid4().hex}{extension}"
-    )
-
-    filepath = os.path.abspath(
-        os.path.join(
+        os.makedirs(
             "chat_media",
-            filename
-        )
-    )
-
-
-    # SAVE FILE
-
-    with open(
-        filepath,
-        "wb"
-    ) as f:
-
-        f.write(
-            media_file.getbuffer()
+            exist_ok=True
         )
 
+        extension = os.path.splitext(
+            media_file.name
+        )[1].lower()
 
-    # ==================================================
-    # IMAGE
-    # ==================================================
+        filename = (
+            f"{uuid.uuid4().hex}{extension}"
+        )
 
-    if extension in [
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".webp"
-    ]:
-
-        media_message = (
-            "__IMAGE__:" + filepath
+        filepath = os.path.abspath(
+            os.path.join(
+                "chat_media",
+                filename
+            )
         )
 
 
-    # ==================================================
-    # VIDEO
-    # ==================================================
+        # SAVE FILE
 
-    elif extension in [
-        ".mp4",
-        ".mov",
-        ".webm"
-    ]:
+        with open(
+            filepath,
+            "wb"
+        ) as f:
 
-        media_message = (
-            "__VIDEO__:" + filepath
+            f.write(
+                media_file.getbuffer()
+            )
+
+
+        # ==================================================
+        # IMAGE
+        # ==================================================
+
+        if extension in [
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp"
+        ]:
+
+            media_message = (
+                "__IMAGE__:" + filepath
+            )
+
+
+        # ==================================================
+        # VIDEO
+        # ==================================================
+
+        elif extension in [
+            ".mp4",
+            ".mov",
+            ".webm"
+        ]:
+
+            media_message = (
+                "__VIDEO__:" + filepath
+            )
+
+        # ==================================================
+        # FILE (PDF / DOC / OTHER DOCUMENTS)
+        # ==================================================
+
+        else:
+
+            media_message = (
+                "__FILE__:" + filepath
+            )
+
+
+        # ==========================================
+        # SEND MESSAGE (supports replying to media too)
+        # ==========================================
+
+        send_message(
+            user,
+            friend,
+            media_message,
+            reply_to=st.session_state.get("reply_to")
         )
 
-    # ==================================================
-    # FILE (PDF / DOC / OTHER DOCUMENTS)
-    # ==================================================
+        st.session_state["reply_to"] = None
 
-    else:
+        st.session_state[_media_upload_version_key] += 1
 
-        media_message = (
-            "__FILE__:" + filepath
-        )
-
-
-    # ==========================================
-    # SEND MESSAGE (supports replying to media too)
-    # ==========================================
-
-    send_message(
-        user,
-        friend,
-        media_message,
-        reply_to=st.session_state.get("reply_to")
-    )
-
-    st.session_state["reply_to"] = None
-
-    st.rerun()
+        st.rerun()
 
 # ==================================================
 # INITIALIZE VOICE SESSION STATE
