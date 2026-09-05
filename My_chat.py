@@ -160,6 +160,14 @@ st.markdown(
     div[class*="st-key-group_jump_to_"] button:hover {
         background: #e4e6ea !important;
     }
+    /* Pull the media widget below the quote closer to it, so a
+       reply preview above a voice/image/video/file attachment
+       reads as attached to it instead of a separate, disconnected
+       element sitting above with a big gap. */
+    div[class*="st-key-jump_to_"],
+    div[class*="st-key-group_jump_to_"] {
+        margin-bottom: -10px !important;
+    }
     </style>
     """,
     unsafe_allow_html=True
@@ -1046,6 +1054,13 @@ CREATE TABLE IF NOT EXISTS group_messages (
 
 conn.commit()
 
+try:
+    cursor.execute(
+        "ALTER TABLE group_messages ADD COLUMN edited INTEGER DEFAULT 0"
+    )
+except sqlite3.OperationalError:
+    pass
+
 # ==========================================
 # ADD REPLY_TO COLUMN IF NOT EXISTS
 # ==========================================
@@ -1079,6 +1094,14 @@ try:
     )
 except sqlite3.OperationalError:
     pass
+
+try:
+    cursor.execute(
+        "ALTER TABLE messages ADD COLUMN edited INTEGER DEFAULT 0"
+    )
+except sqlite3.OperationalError:
+    pass
+
 try:
     cursor.execute(
         "ALTER TABLE users ADD COLUMN profile_pic TEXT"
@@ -1829,6 +1852,25 @@ def delete_message(message_id):
     )
 
     conn.commit()
+
+
+def edit_message(message_id, new_text):
+    """Updates a 1-on-1 text message's content in place. Only meant
+    to be used on the sender's own text messages -- attachments
+    (voice/image/video/file) are never editable."""
+
+    new_text = str(new_text).strip()
+
+    if not new_text:
+        return
+
+    cursor.execute(
+        "UPDATE messages SET message = ?, edited = 1 WHERE id = ?",
+        (new_text, message_id)
+    )
+
+    conn.commit()
+
 # ==================================================
 # BLOCK USER
 # ==================================================
@@ -2370,6 +2412,33 @@ def get_group_name(group_id):
     return result[0] if result else "Group"
 
 
+def edit_group_message(message_id, new_text):
+    """Updates a group text message's content in place. Only meant
+    to be used on the sender's own text messages -- attachments
+    (voice/image/video/file) are never editable."""
+
+    new_text = str(new_text).strip()
+
+    if not new_text:
+        return
+
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False
+    )
+    conn.execute("PRAGMA busy_timeout=30000")
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "UPDATE group_messages SET message = ?, edited = 1 WHERE id = ?",
+        (new_text, message_id)
+    )
+
+    conn.commit()
+    conn.close()
+
+
 def send_group_message(
     group_id,
     sender,
@@ -2850,12 +2919,14 @@ def render_message_actions_menu(
     delete_action,
     attachment_label="Message",
     copy_image_path=None,
-    copy_plain_text=None
+    copy_plain_text=None,
+    edit_state_key=None,
+    edit_value=None
 ):
     """A single '⋮' button per message that opens a small popover
-    with Reply / Forward / Copy / Delete inside it -- used for every
-    message type (text, voice, image, video, file) in both the
-    1-on-1 and group chats, so the message row itself stays clean.
+    with Reply / (Edit) / Forward / Copy / Delete inside it -- used
+    for every message type (text, voice, image, video, file) in both
+    the 1-on-1 and group chats, so the message row itself stays clean.
 
     "Copy" always stores the message in an in-app clipboard
     (st.session_state["clipboard_attachment"]), which a "📌 Paste"
@@ -2871,6 +2942,13 @@ def render_message_actions_menu(
       image copy, so it can be pasted into other apps too.
     Voice/video/file messages only get the in-app clipboard, since
     no browser lets JS put audio/video/files on the system clipboard.
+
+    edit_state_key/edit_value: pass both to show an "✏️ Edit" option
+    (only makes sense for the sender's own TEXT messages -- attachments
+    can't be edited). Clicking it sets st.session_state[edit_state_key]
+    = edit_value and reruns; the caller is responsible for checking
+    that state and rendering an editable text box in its place.
+    Leave both as None to omit Edit entirely.
 
     delete_action must be a zero-argument callable that performs the
     actual deletion (DB row + any file on disk). This function calls
@@ -2890,6 +2968,16 @@ def render_message_actions_menu(
         ):
             st.session_state[reply_state_key] = reply_value
             st.rerun()
+
+        if edit_state_key is not None and edit_value is not None:
+
+            if st.button(
+                "✏️ Edit",
+                key=f"{key_prefix}_edit_btn",
+                use_container_width=True
+            ):
+                st.session_state[edit_state_key] = edit_value
+                st.rerun()
 
         if st.button(
             "↗️ Forward",
@@ -4592,6 +4680,13 @@ if "highlight_message_id" not in st.session_state:
     st.session_state["highlight_message_id"] = None
 
 # ==========================================
+# EDIT STATE (1-on-1 chat)
+# ==========================================
+
+if "editing_message_id" not in st.session_state:
+    st.session_state["editing_message_id"] = None
+
+# ==========================================
 # IN-APP CLIPBOARD (Copy/Paste for attachments)
 # ==========================================
 
@@ -5556,6 +5651,9 @@ if "creating_group" not in st.session_state:
 
 if "group_reply_to" not in st.session_state:
     st.session_state["group_reply_to"] = None
+
+if "group_editing_message_id" not in st.session_state:
+    st.session_state["group_editing_message_id"] = None
     
 if "selected_group" not in st.session_state:
     st.session_state["selected_group"] = None
@@ -7146,65 +7244,99 @@ if page == "Groups":
 
         with col1:
 
-            if reply_html:
-                if st.button(
-                    reply_html,
-                    key=f"group_jump_to_{group_id}_{message_id}",
-                    use_container_width=True
-                ):
-                    st.session_state["group_highlight_message_id"] = reply_to
-                    st.rerun()
+            if st.session_state.get("group_editing_message_id") == message_id:
 
-            _group_is_highlighted = (
-                st.session_state.get("group_highlight_message_id") == message_id
-            )
+                # ================= EDIT MODE =================
 
-            if sender == user:
-
-                _group_bg_color = "#fff3b0" if _group_is_highlighted else "#d9fdd3"
-                _group_border = "border:2px solid #f5b301;" if _group_is_highlighted else ""
-
-                st.markdown(
-                    f'<div id="group_msg_{message_id}" style="text-align:right;margin:6px 0;">'
-                    f'<span style="display:inline-block;background:{_group_bg_color};'
-                    f'padding:8px 12px;border-radius:10px 10px 2px 10px;'
-                    f'color:#111;text-align:left;{_group_border}">'
-                    f'{html.escape(clean_msg)}'
-                    f'<small style="display:block;text-align:right;'
-                    f'margin-top:4px;color:#667;">'
-                    f'{time} {"✓✓" if seen else "✓"}</small>'
-                    f'</span></div>',
-                    unsafe_allow_html=True
+                group_new_text = st.text_input(
+                    "Edit message",
+                    value=clean_msg,
+                    key=f"group_edit_input_{group_id}_{message_id}",
+                    label_visibility="collapsed"
                 )
+
+                gecol1, gecol2 = st.columns([1, 1])
+
+                with gecol1:
+                    if st.button(
+                        "💾 Save",
+                        key=f"group_save_edit_{group_id}_{message_id}",
+                        use_container_width=True
+                    ):
+                        edit_group_message(message_id, group_new_text)
+                        st.session_state["group_editing_message_id"] = None
+                        st.rerun()
+
+                with gecol2:
+                    if st.button(
+                        "✕ Cancel",
+                        key=f"group_cancel_edit_{group_id}_{message_id}",
+                        use_container_width=True
+                    ):
+                        st.session_state["group_editing_message_id"] = None
+                        st.rerun()
+
             else:
 
-                _group_bg_color = "#fff3b0" if _group_is_highlighted else "#ffffff"
-                _group_border = "border:2px solid #f5b301;" if _group_is_highlighted else ""
+                if reply_html:
+                    if st.button(
+                        reply_html,
+                        key=f"group_jump_to_{group_id}_{message_id}",
+                        use_container_width=True
+                    ):
+                        st.session_state["group_highlight_message_id"] = reply_to
+                        st.rerun()
 
-                st.markdown(
-                    f'<div id="group_msg_{message_id}" style="text-align:left;margin:6px 0;">'
-                    f'<span style="display:inline-block;background:{_group_bg_color};'
-                    f'padding:8px 12px;border-radius:10px 10px 10px 2px;'
-                    f'color:#111;{_group_border}">'
-                    f'{html.escape(clean_msg)}'
-                    f'<small style="display:block;margin-top:4px;color:#667;">'
-                    f'{time}</small>'
-                    f'</span></div>',
-                    unsafe_allow_html=True
+                _group_is_highlighted = (
+                    st.session_state.get("group_highlight_message_id") == message_id
                 )
 
-            if _group_is_highlighted:
-                components.html(
-                    f"""
-                    <script>
-                    var el = window.parent.document.getElementById("group_msg_{message_id}");
-                    if (el) {{
-                        el.scrollIntoView({{behavior: "smooth", block: "center"}});
-                    }}
-                    </script>
-                    """,
-                    height=0
-                )
+                if sender == user:
+
+                    _group_bg_color = "#fff3b0" if _group_is_highlighted else "#d9fdd3"
+                    _group_border = "border:2px solid #f5b301;" if _group_is_highlighted else ""
+
+                    st.markdown(
+                        f'<div id="group_msg_{message_id}" style="text-align:right;margin:6px 0;">'
+                        f'<span style="display:inline-block;background:{_group_bg_color};'
+                        f'padding:8px 12px;border-radius:10px 10px 2px 10px;'
+                        f'color:#111;text-align:left;{_group_border}">'
+                        f'{html.escape(clean_msg)}'
+                        f'<small style="display:block;text-align:right;'
+                        f'margin-top:4px;color:#667;">'
+                        f'{time} {"✓✓" if seen else "✓"}</small>'
+                        f'</span></div>',
+                        unsafe_allow_html=True
+                    )
+                else:
+
+                    _group_bg_color = "#fff3b0" if _group_is_highlighted else "#ffffff"
+                    _group_border = "border:2px solid #f5b301;" if _group_is_highlighted else ""
+
+                    st.markdown(
+                        f'<div id="group_msg_{message_id}" style="text-align:left;margin:6px 0;">'
+                        f'<span style="display:inline-block;background:{_group_bg_color};'
+                        f'padding:8px 12px;border-radius:10px 10px 10px 2px;'
+                        f'color:#111;{_group_border}">'
+                        f'{html.escape(clean_msg)}'
+                        f'<small style="display:block;margin-top:4px;color:#667;">'
+                        f'{time}</small>'
+                        f'</span></div>',
+                        unsafe_allow_html=True
+                    )
+
+                if _group_is_highlighted:
+                    components.html(
+                        f"""
+                        <script>
+                        var el = window.parent.document.getElementById("group_msg_{message_id}");
+                        if (el) {{
+                            el.scrollIntoView({{behavior: "smooth", block: "center"}});
+                        }}
+                        </script>
+                        """,
+                        height=0
+                    )
 
         # ==========================================
         # GROUP MESSAGE ACTIONS
@@ -7235,7 +7367,9 @@ if page == "Groups":
                 copy_toast="📋 Message copied",
                 delete_action=_delete_group_text_message,
                 attachment_label="💬 Text message",
-                copy_plain_text=clean_msg
+                copy_plain_text=clean_msg,
+                edit_state_key="group_editing_message_id" if sender == user else None,
+                edit_value=message_id if sender == user else None
             )
 
     # Clear the "jump to" highlight after this render pass, so it
@@ -7365,11 +7499,12 @@ if page == "Groups":
 
             with gfcol1:
 
-                _gf_target = st.selectbox(
+                _gf_targets = st.multiselect(
                     "Forward to",
                     _gf_options,
                     key="group_forward_target_select",
-                    label_visibility="collapsed"
+                    label_visibility="collapsed",
+                    placeholder="Choose one or more groups/friends"
                 )
 
             with gfcol2:
@@ -7379,27 +7514,38 @@ if page == "Groups":
                     key="confirm_group_forward"
                 ):
 
-                    _gf_target_type, _gf_target_id = _gf_map[_gf_target]
+                    if not _gf_targets:
 
-                    if _gf_target_type == "group":
-                        send_group_message(
-                            _gf_target_id,
-                            user,
-                            _gf_content
-                        )
+                        st.warning("Pick at least one group or friend first.")
+
                     else:
-                        send_message(
-                            user,
-                            _gf_target_id,
-                            _gf_content
+
+                        for _gf_target in _gf_targets:
+
+                            _gf_target_type, _gf_target_id = _gf_map[_gf_target]
+
+                            if _gf_target_type == "group":
+                                send_group_message(
+                                    _gf_target_id,
+                                    user,
+                                    _gf_content
+                                )
+                            else:
+                                send_message(
+                                    user,
+                                    _gf_target_id,
+                                    _gf_content
+                                )
+
+                        st.session_state["group_forward_message_id"] = None
+                        st.session_state["group_forward_message_content"] = None
+
+                        _gf_names = ", ".join(
+                            t.split(" ", 1)[1] for t in _gf_targets
                         )
+                        st.success(f"Forwarded to {_gf_names}")
 
-                    st.session_state["group_forward_message_id"] = None
-                    st.session_state["group_forward_message_content"] = None
-
-                    st.success(f"Forwarded to {_gf_target.split(' ', 1)[1]}")
-
-                    st.rerun()
+                        st.rerun()
 
             with gfcol3:
 
@@ -7557,11 +7703,16 @@ if page == "Groups":
 
         with col1:
 
+            if "group_message_version" not in st.session_state:
+                st.session_state["group_message_version"] = {}
+
+            _group_msg_version = st.session_state["group_message_version"].get(group_id, 0)
+
             message = st.text_input(
                 "",
                 placeholder="Message group...",
                 label_visibility="collapsed",
-                key=f"group_message_{group_id}"
+                key=f"group_message_{group_id}_{_group_msg_version}"
             )
 
         # ==============================================
@@ -7583,7 +7734,7 @@ if page == "Groups":
 
             with st.popover("😊"):
 
-                _group_message_key = f"group_message_{group_id}"
+                _group_message_key = f"group_message_{group_id}_{_group_msg_version}"
 
                 _emoji_options = [
                     "😀", "😂", "😍", "👍", "🙏", "🎉",
@@ -7681,6 +7832,14 @@ if page == "Groups":
             st.session_state.pop(
                 "group_reply_to",
                 None
+            )
+
+            # Clear the message box -- bump its widget key's version
+            # so a fresh, empty text_input renders next time.
+            if "group_message_version" not in st.session_state:
+                st.session_state["group_message_version"] = {}
+            st.session_state["group_message_version"][group_id] = (
+                st.session_state["group_message_version"].get(group_id, 0) + 1
             )
 
             st.rerun()
@@ -8094,15 +8253,6 @@ for message_id, sender, msg, time, reply_to in get_messages(
 
         with col1:
 
-            if reply_html:
-                if st.button(
-                    reply_html,
-                    key=f"jump_to_image_{message_id}",
-                    use_container_width=True
-                ):
-                    st.session_state["highlight_message_id"] = reply_to
-                    st.rerun()
-
             if os.path.exists(image_path):
 
                 if sender == user:
@@ -8110,6 +8260,35 @@ for message_id, sender, msg, time, reply_to in get_messages(
                     left, right = st.columns([3, 5])
 
                     with right:
+
+                        if reply_html:
+                            if st.button(
+                                reply_html,
+                                key=f"jump_to_image_{message_id}",
+                                use_container_width=True
+                            ):
+                                st.session_state["highlight_message_id"] = reply_to
+                                st.rerun()
+
+                        if st.session_state.get("highlight_message_id") == message_id:
+                            st.markdown(
+                                f'<div id="msg_{message_id}" style="border:2px solid #f5b301;'
+                                'background:#fff3b0;border-radius:8px;'
+                                'padding:6px 10px;margin-bottom:4px;font-size:13px;">'
+                                '🔶 Replied-to message</div>',
+                                unsafe_allow_html=True
+                            )
+                            components.html(
+                                f"""
+                                <script>
+                                var el = window.parent.document.getElementById("msg_{message_id}");
+                                if (el) {{
+                                    el.scrollIntoView({{behavior: "smooth", block: "center"}});
+                                }}
+                                </script>
+                                """,
+                                height=0
+                            )
 
                         st.image(
                             image_path,
@@ -8126,6 +8305,35 @@ for message_id, sender, msg, time, reply_to in get_messages(
                     left, right = st.columns([5, 3])
 
                     with left:
+
+                        if reply_html:
+                            if st.button(
+                                reply_html,
+                                key=f"jump_to_image_{message_id}",
+                                use_container_width=True
+                            ):
+                                st.session_state["highlight_message_id"] = reply_to
+                                st.rerun()
+
+                        if st.session_state.get("highlight_message_id") == message_id:
+                            st.markdown(
+                                f'<div id="msg_{message_id}" style="border:2px solid #f5b301;'
+                                'background:#fff3b0;border-radius:8px;'
+                                'padding:6px 10px;margin-bottom:4px;font-size:13px;">'
+                                '🔶 Replied-to message</div>',
+                                unsafe_allow_html=True
+                            )
+                            components.html(
+                                f"""
+                                <script>
+                                var el = window.parent.document.getElementById("msg_{message_id}");
+                                if (el) {{
+                                    el.scrollIntoView({{behavior: "smooth", block: "center"}});
+                                }}
+                                </script>
+                                """,
+                                height=0
+                            )
 
                         st.image(
                             image_path,
@@ -8188,21 +8396,41 @@ for message_id, sender, msg, time, reply_to in get_messages(
 
         with col1:
 
-            if reply_html:
-                if st.button(
-                    reply_html,
-                    key=f"jump_to_video_{message_id}",
-                    use_container_width=True
-                ):
-                    st.session_state["highlight_message_id"] = reply_to
-                    st.rerun()
-
             if os.path.exists(video_path):
 
                 if sender == user:
                     left, right = st.columns([3, 5])
 
                     with right:
+
+                        if reply_html:
+                            if st.button(
+                                reply_html,
+                                key=f"jump_to_video_{message_id}",
+                                use_container_width=True
+                            ):
+                                st.session_state["highlight_message_id"] = reply_to
+                                st.rerun()
+
+                        if st.session_state.get("highlight_message_id") == message_id:
+                            st.markdown(
+                                f'<div id="msg_{message_id}" style="border:2px solid #f5b301;'
+                                'background:#fff3b0;border-radius:8px;'
+                                'padding:6px 10px;margin-bottom:4px;font-size:13px;">'
+                                '🔶 Replied-to message</div>',
+                                unsafe_allow_html=True
+                            )
+                            components.html(
+                                f"""
+                                <script>
+                                var el = window.parent.document.getElementById("msg_{message_id}");
+                                if (el) {{
+                                    el.scrollIntoView({{behavior: "smooth", block: "center"}});
+                                }}
+                                </script>
+                                """,
+                                height=0
+                            )
 
                         st.video(
                             video_path
@@ -8218,6 +8446,35 @@ for message_id, sender, msg, time, reply_to in get_messages(
                     left, right = st.columns([5, 3])
 
                     with left:
+
+                        if reply_html:
+                            if st.button(
+                                reply_html,
+                                key=f"jump_to_video_{message_id}",
+                                use_container_width=True
+                            ):
+                                st.session_state["highlight_message_id"] = reply_to
+                                st.rerun()
+
+                        if st.session_state.get("highlight_message_id") == message_id:
+                            st.markdown(
+                                f'<div id="msg_{message_id}" style="border:2px solid #f5b301;'
+                                'background:#fff3b0;border-radius:8px;'
+                                'padding:6px 10px;margin-bottom:4px;font-size:13px;">'
+                                '🔶 Replied-to message</div>',
+                                unsafe_allow_html=True
+                            )
+                            components.html(
+                                f"""
+                                <script>
+                                var el = window.parent.document.getElementById("msg_{message_id}");
+                                if (el) {{
+                                    el.scrollIntoView({{behavior: "smooth", block: "center"}});
+                                }}
+                                </script>
+                                """,
+                                height=0
+                            )
 
                         st.video(
                             video_path
@@ -8278,6 +8535,26 @@ for message_id, sender, msg, time, reply_to in get_messages(
                 ):
                     st.session_state["highlight_message_id"] = reply_to
                     st.rerun()
+
+            if st.session_state.get("highlight_message_id") == message_id:
+                st.markdown(
+                    f'<div id="msg_{message_id}" style="border:2px solid #f5b301;'
+                    'background:#fff3b0;border-radius:8px;'
+                    'padding:6px 10px;margin-bottom:4px;font-size:13px;">'
+                    '🔶 Replied-to message</div>',
+                    unsafe_allow_html=True
+                )
+                components.html(
+                    f"""
+                    <script>
+                    var el = window.parent.document.getElementById("msg_{message_id}");
+                    if (el) {{
+                        el.scrollIntoView({{behavior: "smooth", block: "center"}});
+                    }}
+                    </script>
+                    """,
+                    height=0
+                )
 
             if os.path.exists(file_path):
 
@@ -8375,66 +8652,100 @@ for message_id, sender, msg, time, reply_to in get_messages(
 
     with col1:
 
-        if reply_html:
-            if st.button(
-                reply_html,
-                key=f"jump_to_{message_id}",
-                use_container_width=True
-            ):
-                st.session_state["highlight_message_id"] = reply_to
-                st.rerun()
+        if st.session_state.get("editing_message_id") == message_id:
 
-        _is_highlighted = (
-            st.session_state.get("highlight_message_id") == message_id
-        )
+            # ================= EDIT MODE =================
 
-        if sender == user:
-
-            _bg_color = "#fff3b0" if _is_highlighted else "#d9fdd3"
-            _border = "border:2px solid #f5b301;" if _is_highlighted else ""
-
-            st.markdown(
-                f'<div id="msg_{message_id}" style="text-align:right;margin:6px 0;">'
-                f'<span style="display:inline-block;background:{_bg_color};'
-                f'padding:8px 12px;border-radius:10px 10px 2px 10px;'
-                f'color:#111;text-align:left;{_border}">'
-                f'{html.escape(clean_msg)}'
-                f'<small style="display:block;text-align:right;'
-                f'margin-top:4px;color:#667;">'
-                f'{time} {"✓✓" if seen else "✓"}</small>'
-                f'</span></div>',
-                unsafe_allow_html=True
+            new_text = st.text_input(
+                "Edit message",
+                value=clean_msg,
+                key=f"edit_input_{message_id}",
+                label_visibility="collapsed"
             )
+
+            ecol1, ecol2 = st.columns([1, 1])
+
+            with ecol1:
+                if st.button(
+                    "💾 Save",
+                    key=f"save_edit_{message_id}",
+                    use_container_width=True
+                ):
+                    edit_message(message_id, new_text)
+                    st.session_state["editing_message_id"] = None
+                    st.rerun()
+
+            with ecol2:
+                if st.button(
+                    "✕ Cancel",
+                    key=f"cancel_edit_{message_id}",
+                    use_container_width=True
+                ):
+                    st.session_state["editing_message_id"] = None
+                    st.rerun()
 
         else:
 
-            _bg_color = "#fff3b0" if _is_highlighted else "#ffffff"
-            _border = "border:2px solid #f5b301;" if _is_highlighted else ""
+            if reply_html:
+                if st.button(
+                    reply_html,
+                    key=f"jump_to_{message_id}",
+                    use_container_width=True
+                ):
+                    st.session_state["highlight_message_id"] = reply_to
+                    st.rerun()
 
-            st.markdown(
-                f'<div id="msg_{message_id}" style="text-align:left;margin:6px 0;">'
-                f'<span style="display:inline-block;background:{_bg_color};'
-                f'padding:8px 12px;border-radius:10px 10px 10px 2px;'
-                f'color:#111;{_border}">'
-                f'{html.escape(clean_msg)}'
-                f'<small style="display:block;margin-top:4px;color:#667;">'
-                f'{time}</small>'
-                f'</span></div>',
-                unsafe_allow_html=True
+            _is_highlighted = (
+                st.session_state.get("highlight_message_id") == message_id
             )
 
-        if _is_highlighted:
-            components.html(
-                f"""
-                <script>
-                var el = window.parent.document.getElementById("msg_{message_id}");
-                if (el) {{
-                    el.scrollIntoView({{behavior: "smooth", block: "center"}});
-                }}
-                </script>
-                """,
-                height=0
-            )
+            if sender == user:
+
+                _bg_color = "#fff3b0" if _is_highlighted else "#d9fdd3"
+                _border = "border:2px solid #f5b301;" if _is_highlighted else ""
+
+                st.markdown(
+                    f'<div id="msg_{message_id}" style="text-align:right;margin:6px 0;">'
+                    f'<span style="display:inline-block;background:{_bg_color};'
+                    f'padding:8px 12px;border-radius:10px 10px 2px 10px;'
+                    f'color:#111;text-align:left;{_border}">'
+                    f'{html.escape(clean_msg)}'
+                    f'<small style="display:block;text-align:right;'
+                    f'margin-top:4px;color:#667;">'
+                    f'{time} {"✓✓" if seen else "✓"}</small>'
+                    f'</span></div>',
+                    unsafe_allow_html=True
+                )
+
+            else:
+
+                _bg_color = "#fff3b0" if _is_highlighted else "#ffffff"
+                _border = "border:2px solid #f5b301;" if _is_highlighted else ""
+
+                st.markdown(
+                    f'<div id="msg_{message_id}" style="text-align:left;margin:6px 0;">'
+                    f'<span style="display:inline-block;background:{_bg_color};'
+                    f'padding:8px 12px;border-radius:10px 10px 10px 2px;'
+                    f'color:#111;{_border}">'
+                    f'{html.escape(clean_msg)}'
+                    f'<small style="display:block;margin-top:4px;color:#667;">'
+                    f'{time}</small>'
+                    f'</span></div>',
+                    unsafe_allow_html=True
+                )
+
+            if _is_highlighted:
+                components.html(
+                    f"""
+                    <script>
+                    var el = window.parent.document.getElementById("msg_{message_id}");
+                    if (el) {{
+                        el.scrollIntoView({{behavior: "smooth", block: "center"}});
+                    }}
+                    </script>
+                    """,
+                    height=0
+                )
             
     
         
@@ -8480,7 +8791,9 @@ for message_id, sender, msg, time, reply_to in get_messages(
             copy_toast="📋 Message copied",
             delete_action=lambda: delete_message(message_id),
             attachment_label="💬 Text message",
-            copy_plain_text=clean_msg
+            copy_plain_text=clean_msg,
+            edit_state_key="editing_message_id" if sender == user else None,
+            edit_value=int(message_id) if sender == user else None
         )
 
 
@@ -8516,6 +8829,15 @@ def send_chat_message(message):
 
     # Clear reply selection
     st.session_state["reply_to"] = None
+
+    # Clear the message box -- bump its widget key's version so a
+    # fresh, empty text_input renders next time instead of keeping
+    # the just-sent text sitting in the box.
+    if "chat_message_version" not in st.session_state:
+        st.session_state["chat_message_version"] = {}
+    st.session_state["chat_message_version"][friend] = (
+        st.session_state["chat_message_version"].get(friend, 0) + 1
+    )
 
     # Refresh chat
     st.rerun()
@@ -8616,11 +8938,12 @@ if st.session_state.get("forward_message_id"):
 
         with fcol1:
 
-            forward_to = st.selectbox(
+            forward_to_list = st.multiselect(
                 "Forward to",
                 forward_targets,
                 key="forward_target_select",
-                label_visibility="collapsed"
+                label_visibility="collapsed",
+                placeholder="Choose one or more friends"
             )
 
         with fcol2:
@@ -8630,18 +8953,25 @@ if st.session_state.get("forward_message_id"):
                 key="confirm_forward"
             ):
 
-                send_message(
-                    user,
-                    forward_to,
-                    forward_content
-                )
+                if not forward_to_list:
 
-                st.session_state["forward_message_id"] = None
-                st.session_state["forward_message_content"] = None
+                    st.warning("Pick at least one friend first.")
 
-                st.success(f"Forwarded to {forward_to}")
+                else:
 
-                st.rerun()
+                    for forward_to in forward_to_list:
+                        send_message(
+                            user,
+                            forward_to,
+                            forward_content
+                        )
+
+                    st.session_state["forward_message_id"] = None
+                    st.session_state["forward_message_content"] = None
+
+                    st.success(f"Forwarded to {', '.join(forward_to_list)}")
+
+                    st.rerun()
 
         with fcol3:
 
@@ -8799,11 +9129,16 @@ with chat_footer_box:
 
     with col1:
 
+        if "chat_message_version" not in st.session_state:
+            st.session_state["chat_message_version"] = {}
+
+        _chat_msg_version = st.session_state["chat_message_version"].get(friend, 0)
+
         message = st.text_input(
             "",
             placeholder="Message...",
             label_visibility="collapsed",
-            key=f"chat_message_{friend}"
+            key=f"chat_message_{friend}_{_chat_msg_version}"
         )
 
     # ==============================================
@@ -8825,7 +9160,7 @@ with chat_footer_box:
 
         with st.popover("😊"):
 
-            _chat_message_key = f"chat_message_{friend}"
+            _chat_message_key = f"chat_message_{friend}_{_chat_msg_version}"
 
             _emoji_options = [
                 "😀", "😂", "😍", "👍", "🙏", "🎉",
