@@ -2755,14 +2755,39 @@ def get_recent_chats(user):
 # =========================
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+# ==========================================
+# APP TIMEZONE
+# ==========================================
+# `.astimezone()` with no argument converts to whatever timezone the
+# SERVER's operating system is set to. That's fine when you run the
+# app locally (your PC's OS timezone is your own), but most cloud
+# hosts (Streamlit Community Cloud, GitHub-connected deployments,
+# Docker containers, etc.) run in UTC by default -- so after
+# deploying, ".astimezone()" silently stopped converting anything
+# and every timestamp went back to raw UTC. Using an explicit,
+# fixed timezone here means it's correct everywhere the app runs,
+# regardless of what timezone the server itself is set to.
+#
+# Change this if you (or your users) are in a different timezone.
+try:
+    APP_TIMEZONE = ZoneInfo("Asia/Kolkata")
+except Exception:
+    # Some minimal cloud/Docker images don't ship the IANA timezone
+    # database that ZoneInfo needs. Fall back to a fixed UTC+5:30
+    # offset (India doesn't observe daylight saving, so this is
+    # exactly equivalent to "Asia/Kolkata" either way).
+    from datetime import timedelta
+    APP_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
 
 def to_local_time_str(raw_time):
     """Messages/last_active are stored in UTC (SQLite's
-    datetime('now') / CURRENT_TIMESTAMP). Convert to the local
-    system timezone before showing it, otherwise timestamps look
-    "wrong" by the UTC offset (e.g. a message sent right now shows
-    an hour that isn't the current time)."""
+    datetime('now') / CURRENT_TIMESTAMP). Convert to APP_TIMEZONE
+    before showing it, otherwise timestamps look "wrong" by the UTC
+    offset (e.g. a message sent right now shows an hour that isn't
+    the current time)."""
 
     if not raw_time:
         return raw_time
@@ -2773,7 +2798,7 @@ def to_local_time_str(raw_time):
             "%Y-%m-%d %H:%M:%S"
         ).replace(tzinfo=timezone.utc)
 
-        return dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        return dt_utc.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
     except ValueError:
         return raw_time
@@ -2801,6 +2826,19 @@ def render_copy_button(key, text_to_copy, toast_text="📋 Copied"):
         st.toast(toast_text)
 
 
+def _append_emoji(msg_key, emoji_char):
+    """Appends emoji_char to the message text_input's value. This
+    MUST be used as a button's on_click callback (not called after
+    a plain `if st.button(...):` check) -- callbacks run before the
+    script body re-executes, which is the only time Streamlit allows
+    changing a value for a key that already belongs to an
+    instantiated widget. Doing this after the text_input has already
+    rendered earlier in the same run raises a StreamlitAPIException,
+    which is why the emoji picker wasn't working before."""
+
+    st.session_state[msg_key] = st.session_state.get(msg_key, "") + emoji_char
+
+
 def render_message_actions_menu(
     key_prefix,
     reply_state_key,
@@ -2808,14 +2846,31 @@ def render_message_actions_menu(
     forward_id_key,
     forward_content_key,
     forward_content,
-    copy_text,
     copy_toast,
-    delete_action
+    delete_action,
+    attachment_label="Message",
+    copy_image_path=None,
+    copy_plain_text=None
 ):
     """A single '⋮' button per message that opens a small popover
     with Reply / Forward / Copy / Delete inside it -- used for every
     message type (text, voice, image, video, file) in both the
     1-on-1 and group chats, so the message row itself stays clean.
+
+    "Copy" always stores the message in an in-app clipboard
+    (st.session_state["clipboard_attachment"]), which a "📌 Paste"
+    control in the message composer can send as a real message into
+    ANY chat -- this is what actually makes voice/video/file
+    attachments "copy-and-paste-able", since browsers have no way to
+    put arbitrary binary files on the system clipboard.
+
+    On top of that, where browsers genuinely support it:
+    - copy_plain_text (text messages) also does a real OS clipboard
+      text copy, so it can be pasted into other apps too.
+    - copy_image_path (image messages) also does a real OS clipboard
+      image copy, so it can be pasted into other apps too.
+    Voice/video/file messages only get the in-app clipboard, since
+    no browser lets JS put audio/video/files on the system clipboard.
 
     delete_action must be a zero-argument callable that performs the
     actual deletion (DB row + any file on disk). This function calls
@@ -2848,16 +2903,56 @@ def render_message_actions_menu(
         if st.button(
             "📋 Copy",
             key=f"{key_prefix}_copy_btn",
-            use_container_width=True
+            use_container_width=True,
+            help="Copies this into the app -- use 📌 Paste in any chat to send it there"
         ):
-            components.html(
-                f"""
-                <script>
-                navigator.clipboard.writeText({json.dumps(str(copy_text))});
-                </script>
-                """,
-                height=0
-            )
+            # In-app clipboard -- this is what lets voice/video/file
+            # attachments actually be "pasted" anywhere, since the
+            # browser can't put those on the real system clipboard.
+            st.session_state["clipboard_attachment"] = {
+                "content": forward_content,
+                "label": attachment_label
+            }
+
+            if copy_image_path and os.path.exists(copy_image_path):
+
+                _ext = os.path.splitext(copy_image_path)[1].lower()
+                _mime = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".gif": "image/png",
+                    ".webp": "image/png"
+                }.get(_ext, "image/png")
+
+                with open(copy_image_path, "rb") as _f:
+                    _img_b64 = base64.b64encode(_f.read()).decode()
+
+                components.html(
+                    f"""
+                    <script>
+                    fetch("data:{_mime};base64,{_img_b64}")
+                        .then(res => res.blob())
+                        .then(blob => navigator.clipboard.write([
+                            new ClipboardItem({{ [blob.type]: blob }})
+                        ]))
+                        .catch(err => console.error("Copy image failed:", err));
+                    </script>
+                    """,
+                    height=0
+                )
+
+            elif copy_plain_text is not None:
+
+                components.html(
+                    f"""
+                    <script>
+                    navigator.clipboard.writeText({json.dumps(str(copy_plain_text))});
+                    </script>
+                    """,
+                    height=0
+                )
+
             st.toast(copy_toast)
 
         if st.button(
@@ -2867,6 +2962,38 @@ def render_message_actions_menu(
         ):
             delete_action()
             st.rerun()
+
+
+def render_paste_button(send_action, key):
+    """A compact '📌' button meant to sit right in the message
+    composer row, next to the text box. Click it to send whatever is
+    in the in-app clipboard (see render_message_actions_menu) as a
+    new message into the currently open chat -- this is how
+    voice/video/file attachments (and anything else) actually get
+    "pasted" somewhere, since the browser can't do it for us.
+
+    send_action must be a one-argument callable: send_action(content)
+    that sends `content` (the raw stored message string) to whichever
+    chat is currently open.
+    """
+
+    clip = st.session_state.get("clipboard_attachment")
+
+    if st.button(
+        "📌",
+        key=key,
+        use_container_width=True,
+        help=(
+            f"Paste: {clip['label']}"
+            if clip else "Nothing copied yet"
+        )
+    ):
+        if clip:
+            send_action(clip["content"])
+            st.toast(f"📌 Pasted {clip['label']}")
+            st.rerun()
+        else:
+            st.toast("Nothing to paste yet — copy a message first")
 
 
 def touch_last_active(username):
@@ -2895,9 +3022,8 @@ def touch_last_active(username):
 
 
 def get_presence_status(username):
-    """Returns a display string like '🟢 Online' or 'last seen 10:42 AM',
-    respecting that user's own privacy toggles. Returns '' if both
-    are turned off."""
+    """Returns '🟢 Online' if the user is currently active, or '' the
+    rest of the time (no 'last seen ...' text)."""
 
     conn = sqlite3.connect(
         DB_PATH,
@@ -2911,7 +3037,7 @@ def get_presence_status(username):
 
     cursor.execute(
         """
-        SELECT last_active, show_online_status, show_last_seen
+        SELECT last_active, show_online_status
         FROM users
         WHERE username = ?
         """,
@@ -2924,10 +3050,9 @@ def get_presence_status(username):
     if not row:
         return ""
 
-    last_active_raw, show_online, show_last_seen = row
+    last_active_raw, show_online = row
 
     show_online = True if show_online is None else bool(show_online)
-    show_last_seen = True if show_last_seen is None else bool(show_last_seen)
 
     if not last_active_raw:
         return ""
@@ -2950,22 +3075,6 @@ def get_presence_status(username):
 
     if show_online and seconds_ago <= ONLINE_THRESHOLD_SECONDS:
         return "🟢 Online"
-
-    if show_last_seen:
-
-        # last_active is stored in UTC (SQLite's CURRENT_TIMESTAMP).
-        # Convert it to the local system timezone before formatting,
-        # otherwise the displayed clock time is off by the UTC
-        # offset (e.g. showing a UTC hour instead of the real one).
-        last_active_local = last_active.astimezone()
-        today_local = datetime.now().astimezone().date()
-
-        if last_active_local.date() == today_local:
-            time_str = last_active_local.strftime("%I:%M %p").lstrip("0")
-            return f"last seen today at {time_str}"
-        else:
-            date_str = last_active_local.strftime("%d %b, %I:%M %p").lstrip("0")
-            return f"last seen {date_str}"
 
     return ""
 
@@ -4333,7 +4442,7 @@ if page == "Settings":
 
         cursor.execute(
             """
-            SELECT show_online_status, show_last_seen
+            SELECT show_online_status
             FROM users
             WHERE username = ?
             """,
@@ -4341,12 +4450,10 @@ if page == "Settings":
         )
         _row = cursor.fetchone()
         _db_online_default = bool(_row[0]) if _row and _row[0] is not None else True
-        _db_last_seen_default = bool(_row[1]) if _row and _row[1] is not None else True
 
         if "privacy_settings" not in st.session_state:
           st.session_state["privacy_settings"] = {
             "online_status": _db_online_default,
-            "last_seen": _db_last_seen_default,
             "profile_photo": True,
             "read_receipts": True
         }
@@ -4357,12 +4464,6 @@ if page == "Settings":
             "Show Online Status",
             value=privacy["online_status"],
             key="privacy_online"
-        )
-
-        last_seen = st.toggle(
-            "Show Last Seen",
-            value=privacy["last_seen"],
-            key="privacy_last_seen"
         )
 
         profile_photo = st.toggle(
@@ -4380,7 +4481,6 @@ if page == "Settings":
         if st.button("Save Privacy",key="save_privacy"):
           st.session_state["privacy_settings"] = {
             "online_status": online,
-            "last_seen": last_seen,
             "profile_photo": profile_photo,
             "read_receipts": read_receipts
         }
@@ -4388,10 +4488,10 @@ if page == "Settings":
           cursor.execute(
               """
               UPDATE users
-              SET show_online_status = ?, show_last_seen = ?
+              SET show_online_status = ?
               WHERE username = ?
               """,
-              (int(online), int(last_seen), user)
+              (int(online), user)
           )
           conn.commit()
 
@@ -4490,6 +4590,13 @@ if "reply_to" not in st.session_state:
 
 if "highlight_message_id" not in st.session_state:
     st.session_state["highlight_message_id"] = None
+
+# ==========================================
+# IN-APP CLIPBOARD (Copy/Paste for attachments)
+# ==========================================
+
+if "clipboard_attachment" not in st.session_state:
+    st.session_state["clipboard_attachment"] = None
 
 # ==========================================
 # FORWARD STATE (1-on-1 chat)
@@ -6670,9 +6777,9 @@ if page == "Groups":
                     forward_id_key="group_forward_message_id",
                     forward_content_key="group_forward_message_content",
                     forward_content=str(msg),
-                    copy_text=audio_path,
-                    copy_toast="📋 Voice message path copied",
-                    delete_action=_delete_group_voice_message
+                    copy_toast="📋 Voice message copied — use 📌 Paste to send it anywhere",
+                    delete_action=_delete_group_voice_message,
+                    attachment_label="🎤 Voice message"
                 )
 
             continue
@@ -6770,9 +6877,10 @@ if page == "Groups":
                     forward_id_key="group_forward_message_id",
                     forward_content_key="group_forward_message_content",
                     forward_content=str(msg),
-                    copy_text=image_path,
-                    copy_toast="📋 Image path copied",
-                    delete_action=_delete_group_image_message
+                    copy_toast="📋 Image copied — paste it elsewhere, or 📌 Paste it into any chat",
+                    delete_action=_delete_group_image_message,
+                    attachment_label="🖼️ Image",
+                    copy_image_path=image_path
                 )
 
             continue
@@ -6867,9 +6975,9 @@ if page == "Groups":
                     forward_id_key="group_forward_message_id",
                     forward_content_key="group_forward_message_content",
                     forward_content=str(msg),
-                    copy_text=video_path,
-                    copy_toast="📋 Video path copied",
-                    delete_action=_delete_group_video_message
+                    copy_toast="📋 Video copied — use 📌 Paste to send it anywhere",
+                    delete_action=_delete_group_video_message,
+                    attachment_label="🎥 Video"
                 )
 
             continue
@@ -6977,9 +7085,9 @@ if page == "Groups":
                     forward_id_key="group_forward_message_id",
                     forward_content_key="group_forward_message_content",
                     forward_content=str(msg),
-                    copy_text=file_path,
-                    copy_toast="📋 File path copied",
-                    delete_action=_delete_group_file_message
+                    copy_toast="📋 File copied — use 📌 Paste to send it anywhere",
+                    delete_action=_delete_group_file_message,
+                    attachment_label=f"📎 {os.path.basename(file_path)}"
                 )
 
             continue
@@ -7124,9 +7232,10 @@ if page == "Groups":
                 forward_id_key="group_forward_message_id",
                 forward_content_key="group_forward_message_content",
                 forward_content=str(msg),
-                copy_text=clean_msg,
                 copy_toast="📋 Message copied",
-                delete_action=_delete_group_text_message
+                delete_action=_delete_group_text_message,
+                attachment_label="💬 Text message",
+                copy_plain_text=clean_msg
             )
 
     # Clear the "jump to" highlight after this render pass, so it
@@ -7437,8 +7546,8 @@ if page == "Groups":
 
     with group_footer_box:
 
-        col1, col_emoji, col2, col3, col4 = st.columns(
-            [6.3, 0.7, 0.7, 0.7, 0.7],
+        col1, col_paste, col_emoji, col2, col3, col4 = st.columns(
+            [5.6, 0.7, 0.7, 0.7, 0.7, 0.7],
             vertical_alignment="center"
         )
 
@@ -7453,6 +7562,17 @@ if page == "Groups":
                 placeholder="Message group...",
                 label_visibility="collapsed",
                 key=f"group_message_{group_id}"
+            )
+
+        # ==============================================
+        # PASTE (in-app clipboard)
+        # ==============================================
+
+        with col_paste:
+
+            render_paste_button(
+                send_action=lambda content: send_group_message(group_id, user, content),
+                key=f"group_paste_btn_{group_id}"
             )
 
         # ==============================================
@@ -7477,14 +7597,12 @@ if page == "Groups":
 
                     with _emoji_cols[_i % 4]:
 
-                        if st.button(
+                        st.button(
                             _emoji,
-                            key=f"group_emoji_{group_id}_{_i}"
-                        ):
-                            st.session_state[_group_message_key] = (
-                                st.session_state.get(_group_message_key, "") + _emoji
-                            )
-                            st.rerun()
+                            key=f"group_emoji_{group_id}_{_i}",
+                            on_click=_append_emoji,
+                            args=(_group_message_key, _emoji)
+                        )
 
         # ==============================================
         # VOICE MESSAGE (toggle recorder, like 1-on-1 chat)
@@ -7950,9 +8068,9 @@ for message_id, sender, msg, time, reply_to in get_messages(
                     forward_id_key="forward_message_id",
                     forward_content_key="forward_message_content",
                     forward_content=str(msg),
-                    copy_text=audio_path,
-                    copy_toast="📋 Voice message path copied",
-                    delete_action=_delete_voice_message
+                    copy_toast="📋 Voice message copied — use 📌 Paste to send it anywhere",
+                    delete_action=_delete_voice_message,
+                    attachment_label="🎤 Voice message"
                 )
 
             continue
@@ -8043,9 +8161,10 @@ for message_id, sender, msg, time, reply_to in get_messages(
                 forward_id_key="forward_message_id",
                 forward_content_key="forward_message_content",
                 forward_content=str(msg),
-                copy_text=image_path,
-                copy_toast="📋 Image path copied",
-                delete_action=_delete_image_message
+                copy_toast="📋 Image copied — paste it elsewhere, or 📌 Paste it into any chat",
+                delete_action=_delete_image_message,
+                attachment_label="🖼️ Image",
+                copy_image_path=image_path
             )
 
         # IMPORTANT
@@ -8127,9 +8246,9 @@ for message_id, sender, msg, time, reply_to in get_messages(
                 forward_id_key="forward_message_id",
                 forward_content_key="forward_message_content",
                 forward_content=str(msg),
-                copy_text=video_path,
-                copy_toast="📋 Video path copied",
-                delete_action=_delete_video_message
+                copy_toast="📋 Video copied — use 📌 Paste to send it anywhere",
+                delete_action=_delete_video_message,
+                attachment_label="🎥 Video"
             )
 
         # IMPORTANT
@@ -8214,9 +8333,9 @@ for message_id, sender, msg, time, reply_to in get_messages(
                 forward_id_key="forward_message_id",
                 forward_content_key="forward_message_content",
                 forward_content=str(msg),
-                copy_text=file_path,
-                copy_toast="📋 File path copied",
-                delete_action=_delete_file_message
+                copy_toast="📋 File copied — use 📌 Paste to send it anywhere",
+                delete_action=_delete_file_message,
+                attachment_label=f"📎 {os.path.basename(file_path)}"
             )
 
         # IMPORTANT
@@ -8358,9 +8477,10 @@ for message_id, sender, msg, time, reply_to in get_messages(
             forward_id_key="forward_message_id",
             forward_content_key="forward_message_content",
             forward_content=str(msg),
-            copy_text=clean_msg,
             copy_toast="📋 Message copied",
-            delete_action=lambda: delete_message(message_id)
+            delete_action=lambda: delete_message(message_id),
+            attachment_label="💬 Text message",
+            copy_plain_text=clean_msg
         )
 
 
@@ -8668,8 +8788,8 @@ chat_footer_box = st.container(key="chat_footer_box")
 
 with chat_footer_box:
 
-    col1, col_emoji, col2, col3, col4 = st.columns(
-        [6.3, 0.7, 0.7, 0.7, 0.7],
+    col1, col_paste, col_emoji, col2, col3, col4 = st.columns(
+        [5.6, 0.7, 0.7, 0.7, 0.7, 0.7],
         vertical_alignment="center"
     )
 
@@ -8684,6 +8804,17 @@ with chat_footer_box:
             placeholder="Message...",
             label_visibility="collapsed",
             key=f"chat_message_{friend}"
+        )
+
+    # ==============================================
+    # PASTE (in-app clipboard)
+    # ==============================================
+
+    with col_paste:
+
+        render_paste_button(
+            send_action=lambda content: send_message(user, friend, content),
+            key=f"chat_paste_btn_{friend}"
         )
 
     # ==============================================
@@ -8708,14 +8839,12 @@ with chat_footer_box:
 
                 with _emoji_cols[_i % 4]:
 
-                    if st.button(
+                    st.button(
                         _emoji,
-                        key=f"chat_emoji_{friend}_{_i}"
-                    ):
-                        st.session_state[_chat_message_key] = (
-                            st.session_state.get(_chat_message_key, "") + _emoji
-                        )
-                        st.rerun()
+                        key=f"chat_emoji_{friend}_{_i}",
+                        on_click=_append_emoji,
+                        args=(_chat_message_key, _emoji)
+                    )
 
     # ==============================================
     # VOICE MESSAGE
